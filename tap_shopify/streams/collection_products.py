@@ -13,9 +13,8 @@ class CollectionProducts(Stream):
     replication_key = 'updated_at'
 
     def get_objects(self):
-        
         while True:
-            page = self.replication_object.find()
+            page = self.get_page()
             for collection in page:
                 for product in collection.products():
                     yield product
@@ -23,6 +22,10 @@ class CollectionProducts(Stream):
                 page = page.next_page()
             else:
                 break
+
+    @shopify_error_handling
+    def get_page(self):
+        return self.replication_object.find()
 
     def sync(self):
         for product in self.get_objects():
