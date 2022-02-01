@@ -37,7 +37,7 @@ def is_not_status_code_fn(status_code):
 
 def leaky_bucket_handler(details):
     LOGGER.info("Received 429 -- sleeping for %s seconds",
-                details['wait'])
+                details.get('wait', '5'))
 
 def retry_handler(details):
     LOGGER.info("Received 500 or retryable error -- Retry %s/%s",
@@ -52,7 +52,7 @@ def retry_after_wait_gen(**kwargs):
     # Retry-After is an undocumented header. But honoring
     # it was proven to work in our spikes.
     # It's been observed to come through as lowercase, so fallback if not present
-    sleep_time_str = resp.headers.get('Retry-After', resp.headers.get('retry-after'))
+    sleep_time_str = resp.headers.get('Retry-After', resp.headers.get('retry-after', '5.0'))
     yield math.floor(float(sleep_time_str))
 
 def shopify_error_handling(fnc):
