@@ -68,7 +68,7 @@ def shopify_error_handling(fnc):
                            TimeoutError,
                            urllib.error.URLError,
                           ),
-                          giveup=is_not_status_code_fn(range(500, 599)),
+                          giveup=is_not_status_code_fn(list(range(500, 599)) + [429]),
                           on_backoff=retry_handler,
                           max_tries=MAX_RETRIES,
                           factor=FACTOR)
