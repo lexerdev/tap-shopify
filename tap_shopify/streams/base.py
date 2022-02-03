@@ -57,7 +57,9 @@ def retry_after_wait_gen(**kwargs):
 
 def shopify_error_handling(fnc):
     @backoff.on_exception(backoff.expo,
-                          (pyactiveresource.connection.ServerError,
+                          (
+                           pyactiveresource.connection.ClientError,
+                           pyactiveresource.connection.ServerError,
                            pyactiveresource.connection.Error,
                            pyactiveresource.formats.Error,
                            simplejson.scanner.JSONDecodeError,
@@ -70,12 +72,14 @@ def shopify_error_handling(fnc):
                           on_backoff=retry_handler,
                           max_tries=MAX_RETRIES,
                           factor=FACTOR)
-    @backoff.on_exception(retry_after_wait_gen,
-                          pyactiveresource.connection.ClientError,
-                          giveup=is_not_status_code_fn([429]),
-                          on_backoff=leaky_bucket_handler,
-                          # No jitter as we want a constant value
-                          jitter=None)
+    # This special decorator for 429s has been moved to above handler
+    # See commit / PR notes for more detail
+    # @backoff.on_exception(retry_after_wait_gen,
+    #                       pyactiveresource.connection.ClientError,
+    #                       giveup=is_not_status_code_fn([429]),
+    #                       on_backoff=leaky_bucket_handler,
+    #                       # No jitter as we want a constant value
+    #                       jitter=None)
     @functools.wraps(fnc)
     def wrapper(*args, **kwargs):
         return fnc(*args, **kwargs)
