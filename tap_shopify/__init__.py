@@ -26,7 +26,7 @@ def initialize_shopify_client():
     api_key = Context.config['api_key']
     shop = Context.config['shop']
     version = '2023-07'
-    LOGGER.info('Initializing Shopify client for version', version)
+    LOGGER.info(f'Initializing Shopify client for {version}')
     session = shopify.Session(shop, version, api_key)
     shopify.ShopifyResource.activate_session(session)
 
