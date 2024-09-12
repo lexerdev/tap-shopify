@@ -2,17 +2,17 @@ import datetime
 import functools
 import math
 import sys
-import http
-
 import socket
+from urllib.error import URLError
+import http
 import backoff
 import pyactiveresource
 import pyactiveresource.formats
 import simplejson
 import singer
 from singer import metrics, utils
+from singer.utils import strptime_to_utc
 from tap_shopify.context import Context
-import urllib
 
 LOGGER = singer.get_logger()
 
@@ -33,6 +33,47 @@ FACTOR = 3
 
 # If not timeout is specified/can be parsed from the response, then wait for this amount
 DEFAULT_WAIT = 20
+
+# We have observed transactions with receipt objects that contain both:
+#   - `token` and `Token`
+#   - `version` and `Version`
+#   - `ack` and `Ack`
+# keys on transactions where PayPal is the payment type. We reached out to
+# PayPal support and they told us the values should be the same, so one
+# can be safely ignored since its a duplicate. Example: The logic is to
+# prefer `token` if both are present and equal, convert `Token` -> `token`
+# if only `Token` is present, and throw an error if both are present and
+# their values are not equal.
+def canonicalize(transaction_dict, field_name):
+    field_name_upper = field_name.capitalize()
+    # Not all Shopify transactions have receipts. Facebook has been shown
+    # to push a null receipt through the transaction
+    receipt = transaction_dict.get('receipt', {})
+    if receipt:
+        value_lower = receipt.get(field_name)
+        value_upper = receipt.get(field_name_upper)
+        if value_lower and value_upper:
+            if value_lower == value_upper:
+                LOGGER.info((
+                    "Transaction (id=%d) contains a receipt "
+                    "that has `%s` and `%s` keys with the same "
+                    "value. Removing the `%s` key."),
+                            transaction_dict['id'],
+                            field_name,
+                            field_name_upper,
+                            field_name_upper)
+                transaction_dict['receipt'].pop(field_name_upper)
+            else:
+                raise ValueError((
+                    "Found Transaction (id={}) with a receipt that has "
+                    "`{}` and `{}` keys with the different "
+                    "values. Contact Shopify/PayPal support.").format(
+                        transaction_dict['id'],
+                        field_name_upper,
+                        field_name))
+        elif value_upper:
+            # pylint: disable=line-too-long
+            transaction_dict["receipt"][field_name] = transaction_dict['receipt'].pop(field_name_upper)
 
 # function to return request timeout
 def get_request_timeout():
@@ -86,6 +127,10 @@ def is_timeout_error(error_raised):
     return True
 
 def shopify_error_handling(fnc):
+    @backoff.on_exception(backoff.expo,
+                          (http.client.IncompleteRead, ConnectionResetError),
+                          max_tries=MAX_RETRIES,
+                          factor=2)
     @backoff.on_exception(backoff.expo, # timeout error raise by Shopify
                           (pyactiveresource.connection.Error, socket.timeout),
                           giveup=is_timeout_error,
@@ -99,13 +144,20 @@ def shopify_error_handling(fnc):
                            http.client.IncompleteRead,
                            ConnectionResetError,
                            TimeoutError,
-                           urllib.error.URLError,
+                           URLError
                           ),
+                          giveup=is_not_status_code_fn(range(500, 599)),
                           on_backoff=retry_handler,
                           max_tries=MAX_RETRIES,
                           factor=FACTOR)
+    @backoff.on_exception(backoff.expo,
+                          pyactiveresource.connection.ResourceNotFound,
+                          giveup=is_not_status_code_fn([404]),
+                          on_backoff=retry_handler,
+                          max_tries=MAX_RETRIES)
     @backoff.on_exception(retry_after_wait_gen,
                           pyactiveresource.connection.ClientError,
+                          giveup=is_not_status_code_fn([429]),
                           on_backoff=leaky_bucket_handler,
                           max_tries=MAX_RETRIES,
                           # No jitter as we want a constant value
@@ -154,6 +206,10 @@ class Stream():
                                    self.name,
                                    'since_id')
 
+    def get_updated_at_max(self):
+        updated_at_max = Context.state.get('bookmarks', {}).get(self.name, {}).get('updated_at_max')
+        return utils.strptime_with_tz(updated_at_max) if updated_at_max else None
+
     def update_bookmark(self, bookmark_value, bookmark_key=None):
         # NOTE: Bookmarking can never be updated to not get the most
         # recent thing it saw the next time you run, because the querying
@@ -187,7 +243,9 @@ class Stream():
         }
 
     def get_objects(self):
+        last_sync_interrupted_at = self.get_updated_at_max()
         updated_at_min = self.get_bookmark()
+        max_bookmark = updated_at_min
 
         stop_time = singer.utils.now().replace(microsecond=0)
         date_window_size = float(Context.config.get("date_window_size", DATE_WINDOW_SIZE))
@@ -205,7 +263,14 @@ class Stream():
             # think it has something to do with how the API treats
             # microseconds on its date windows. Maybe it's possible to
             # drop data due to rounding errors or something like that?
-            updated_at_max = updated_at_min + datetime.timedelta(days=date_window_size)
+            # If last sync was interrupted, set updated_at_max to
+            # updated_at_max bookmarked in the interrupted sync.
+            # This will make sure that records with lower id than since_id
+            # which got updated later won't be missed
+            updated_at_max = (last_sync_interrupted_at
+                              or updated_at_min + datetime.timedelta(days=date_window_size))
+            last_sync_interrupted_at = None
+
             if updated_at_max > stop_time:
                 updated_at_max = stop_time
             while True:
@@ -225,6 +290,9 @@ class Stream():
                         # since_id parameter.
                         raise OutOfOrderIdsError("obj.id < since_id: {} < {}".format(
                             obj.id, since_id))
+                    replication_value = strptime_to_utc(getattr(obj, self.replication_key))
+                    if replication_value > max_bookmark:
+                        max_bookmark = replication_value
                     yield obj
 
                 # You know you're at the end when the current page has
@@ -233,7 +301,9 @@ class Stream():
                     # Save the updated_at_max as our bookmark as we've synced all rows up in our
                     # window and can move forward. Also remove the since_id because we want to
                     # restart at 1.
-                    Context.state.get('bookmarks', {}).get(self.name, {}).pop('since_id', None)
+                    stream_bookmarks = Context.state.get('bookmarks', {}).get(self.name, {})
+                    stream_bookmarks.pop('since_id', None)
+                    stream_bookmarks.pop('updated_at_max', None)
                     self.update_bookmark(utils.strftime(updated_at_max))
                     break
 
@@ -245,10 +315,15 @@ class Stream():
                         objects[-1].id, max([o.id for o in objects])))
                 since_id = objects[-1].id
 
-                # Put since_id into the state.
+                # Put since_id and updated_at_max into the state.
                 self.update_bookmark(since_id, bookmark_key='since_id')
+                self.update_bookmark(utils.strftime(updated_at_max), bookmark_key='updated_at_max')
 
             updated_at_min = updated_at_max
+        bookmark = max(min(stop_time,
+                           max_bookmark),
+                       (stop_time - datetime.timedelta(days=date_window_size)))
+        self.update_bookmark(utils.strftime(bookmark))
 
     def sync(self):
         """Yield's processed SDK object dicts to the caller.
